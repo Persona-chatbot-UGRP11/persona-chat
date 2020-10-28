@@ -18,6 +18,10 @@ pip3 install git+https://github.com/SKT-AI/KoGPT2#egg=kogpt2
 git clone <this repository>
   
   
+  
+  
 #reference
+
 https://github.com/SKT-AI/KoGPT2
+
 https://github.com/haven-jeon/KoGPT2-chatbot
