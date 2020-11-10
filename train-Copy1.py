@@ -1,0 +1,382 @@
+# -*- coding: utf-8 -*-
+import argparse
+import logging
+import math
+
+import gluonnlp as nlp
+import mxnet as mx
+import pandas as pd
+from gluonnlp.data import SentencepieceTokenizer
+from kogpt2.mxnet_kogpt2 import get_mxnet_kogpt2_model
+from kogpt2.utils import get_tokenizer
+from mxnet import gluon, nd
+from mxnet.gluon import nn
+
+#minjoo modify) add seq2seq
+import seq2seq_wh
+from seq2seq_wh import EncoderRNN, AttnDecoderRNN, evaluate
+import torch
+import pickle
+
+
+parser = argparse.ArgumentParser(description='Simsimi based on KoGPT-2')
+
+parser.add_argument('--num-epoch',
+                    type=int,
+                    default=1,
+                    help='number of iterations to train (default: 2)')
+
+parser.add_argument('--max-seq-len',
+                    type=int,
+                    default=32,
+                    help='max sentence length on input (default: 32)')
+
+#minjoo modify) origin default value 64 (mxnet out of memory)
+parser.add_argument('--batch-size',
+                    type=int,
+                    default=32,
+                    help='batch size for training (default: 64)')
+
+parser.add_argument('--chat',
+                    action='store_true',
+                    default=False,
+                    help='response generation on given user input')
+
+parser.add_argument('--sentiment',
+                    type=str,
+                    default='0',
+                    help='sentiment for system. 0 is neutral, 1 is negative, 2 is positive.')
+
+
+parser.add_argument('--model_params',
+                    type=str,
+                    default='kogpt2_chat.params',
+                    help='model binary for starting chat')
+
+parser.add_argument('--train',
+                    action='store_true',
+                    default=False,
+                    help='eval train set (default: False)')
+
+
+parser.add_argument(
+    '--accumulate',
+    type=int,
+    default=1,
+    help='accumulate gradient to achieve the same result with a large batch size')
+
+opt = parser.parse_args()
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+U_TKN = '<usr>'
+S_TKN = '<sys>'
+BOS = '<s>'
+EOS = '</s>'
+MASK = '<unused0>'
+SENT = '<unused1>'
+
+
+class ChatDataset(gluon.data.Dataset):
+    def __init__(self, chats, tok_path, vocab, max_len=32):
+        self._data = chats
+        self._tok_path = tok_path
+        self.tokenizer = None
+        self.first = True
+        self.q_token = U_TKN
+        self.a_token = S_TKN
+        self.sent_token = SENT
+        self.bos = BOS
+        self.eos = EOS
+        self.maskt = MASK
+        self.vocab = vocab
+        self.max_len = max_len
+        self.padder = nlp.data.PadSequence(
+            max_len, pad_val=self.vocab[self.vocab.padding_token])
+
+    def _activate_sp(self):
+        self.tokenizer = nlp.data.SentencepieceTokenizer(self._tok_path, 0, 0)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __getitem__(self, idx):
+        if self.tokenizer is None:
+            self._activate_sp()
+        turn = self._data.iloc[idx]
+        q = turn['Q']
+        a = turn['A']
+        sentiment = str(turn['label'])
+        q_toked = [
+            self.q_token,
+        ] + self.tokenizer(q) + [
+            self.eos,
+        ] + [self.sent_token] + self.tokenizer(sentiment) + [
+            self.eos,
+        ]
+        q_len = len(q_toked)
+        a_toked = [
+            self.a_token,
+        ] + self.tokenizer(a) + [
+            self.eos,
+        ]
+        a_len = len(a_toked)
+        if q_len + a_len > self.max_len:
+            a_len = self.max_len - q_len
+            if a_len <= 0:
+                q_toked = q_toked[-(int(self.max_len/2)):]
+                q_len = len(q_toked)
+                a_len = self.max_len - q_len
+                assert a_len > 0
+            a_toked = a_toked[:a_len]
+            a_len = len(a_toked)
+            assert a_len == len(a_toked), f'{a_len} ==? {len(a_toked)}'
+        # [<mask>, <mask>, ...., <mask>, ..., A.. <eos>, <pad>....]
+        labels = [
+            self.maskt,
+        ] * q_len + a_toked[1:]
+        if self.first:
+            logging.info("contexts : {}".format(q))
+            logging.info("toked ctx: {}".format(q_toked))
+            logging.info("response : {}".format(a))
+            logging.info("toked response : {}".format(a_toked))
+            logging.info('labels {}'.format(labels))
+            self.first = False
+        mask = [0] * q_len + [1] * a_len + [0] * (self.max_len - q_len - a_len)
+        return (self.padder(self.vocab[q_toked + a_toked]), nd.array(mask),
+                self.padder(self.vocab[labels]))
+
+
+class KoGPT2Chat(nn.HybridBlock):
+    def __init__(self, kogpt2, prefix=None, params=None):
+        super(KoGPT2Chat, self).__init__(prefix=prefix, params=params)
+        self.kogpt2 = kogpt2
+
+    def hybrid_forward(self, F, inputs):
+        # (batch, seq_len, hiddens)
+        output, _ = self.kogpt2(inputs)
+        return output
+
+
+if mx.context.num_gpus() > 0:
+    ctx = mx.gpu()
+else:
+    ctx = mx.cpu()
+
+
+def train():
+    tok_path = get_tokenizer()
+    model, vocab = get_mxnet_kogpt2_model(ctx=ctx)
+    # tok = SentencepieceTokenizer(tok_path, num_best=0, alpha=0)
+
+    data = pd.read_csv('./Chatbot_data/ChatbotData.csv')
+
+    max_len = opt.max_seq_len
+    train_set = ChatDataset(data, tok_path, vocab, max_len=max_len)
+    batch_size = opt.batch_size
+
+    train_dataloader = mx.gluon.data.DataLoader(train_set,
+                                                batch_size=batch_size,
+                                                num_workers=5,
+                                                shuffle=True)
+    kogptqa = KoGPT2Chat(model)
+    kogptqa.hybridize()
+
+    # softmax cross entropy loss for classification
+    loss_function = gluon.loss.SoftmaxCrossEntropyLoss()
+    loss_function.hybridize()
+
+    num_epochs = opt.num_epoch
+    lr = 5e-5
+    trainer = gluon.Trainer(kogptqa.collect_params(), 'bertadam', {
+        'learning_rate': lr,
+        'epsilon': 1e-8,
+        'wd': 0.01
+    })
+    # LayerNorm과 Bias에는 Weight Decay를 적용하지 않는다.
+    for _, v in kogptqa.collect_params('.*beta|.*gamma|.*bias').items():
+        v.wd_mult = 0.0
+    params = [
+        p for p in kogptqa.collect_params().values() if p.grad_req != 'null'
+    ]
+    # learning rate warmup
+    accumulate = opt.accumulate
+    step_size = batch_size * accumulate if accumulate else batch_size
+    num_train_examples = len(train_set)
+    num_train_steps = int(num_train_examples / step_size * num_epochs)
+    warmup_ratio = 0.1
+    num_warmup_steps = int(num_train_steps * warmup_ratio)
+    step_num = 0
+    all_model_params = kogptqa.collect_params()
+
+    log_interval = 50
+    neg = -1e18
+    # Set grad_req if gradient accumulation is required
+    if accumulate and accumulate > 1:
+        for p in params:
+            p.grad_req = 'add'
+
+    for epoch_id in range(num_epochs):
+        step_loss = 0
+        for batch_id, (token_ids, mask, label) in enumerate(train_dataloader):
+            if step_num < num_warmup_steps:
+                new_lr = lr * step_num / num_warmup_steps
+            else:
+                non_warmup_steps = step_num - num_warmup_steps
+                offset = non_warmup_steps / (num_train_steps -
+                                             num_warmup_steps)
+                new_lr = lr - offset * lr
+            trainer.set_learning_rate(new_lr)
+            with mx.autograd.record():
+                # load data to GPU or GPU
+                token_ids = token_ids.as_in_context(ctx)
+                mask = mask.as_in_context(ctx)
+                label = label.as_in_context(ctx)
+                # forward computation
+                out = kogptqa(token_ids)
+                masked_out = nd.where(
+                    mask.expand_dims(axis=2).repeat(repeats=out.shape[2],
+                                                    axis=2), out,
+                    neg * nd.ones_like(out))
+                # loss for responses exincluding MASK and PAD
+                ls = loss_function(masked_out, label).sum() / mask.sum()
+            # backward computation
+            ls.backward()
+            if not accumulate or (batch_id + 1) % accumulate == 0:
+                trainer.allreduce_grads()
+                nlp.utils.clip_grad_global_norm(params, 1)
+                trainer.update(accumulate if accumulate else 1)
+                step_num += 1
+                if accumulate and accumulate > 1:
+                    # set grad to zero for gradient accumulation
+                    all_model_params.zero_grad()
+            step_loss += ls.asscalar()
+            if step_num % log_interval == 0 and step_num > 0:
+                print(
+                    '[Epoch {} Batch {}/{}] loss={:.4f}, lr={:.10f}, train ppl={:.3f}'
+                    .format(epoch_id + 1, batch_id + 1, len(train_dataloader),
+                            step_loss / log_interval, trainer.learning_rate,
+                            math.exp(step_loss / log_interval)))
+                step_loss = 0
+    logging.info('saving model file to {}'.format(opt.model_params))
+    kogptqa.save_parameters(opt.model_params)
+
+
+def chat(model_params, sent='0'):
+    tok_path = get_tokenizer()
+    model, vocab = get_mxnet_kogpt2_model(ctx=ctx)
+    tok = SentencepieceTokenizer(tok_path, num_best=0, alpha=0)
+    kogptqa = KoGPT2Chat(model)
+    kogptqa.load_parameters(model_params, ctx=ctx)
+    sent_tokens = tok(sent)
+    
+    #minjoo modify) input ft not working. read input question file
+    #<origin code>
+    #while 1:
+        #q = input('user > ').strip()
+    with open('./chat_text_question/office_input_question.txt', 'rt', encoding = 'UTF-8') as data:
+        origin = data.read()
+        lst1 = origin.splitlines()
+    
+    #minjoo modify) file input -> list output return
+    ques_list = []
+    return_list = []
+    for sen in lst1:
+        q = sen
+        print('user > ', q)
+        
+        
+        
+        if q == 'quit':
+            break
+        q_tok = tok(q)
+        a = ''
+        a_tok = []
+        while 1:
+            input_ids = mx.nd.array([vocab[U_TKN]] + vocab[q_tok] +
+                                    vocab[EOS, SENT] + vocab[sent_tokens] +
+                                    vocab[EOS, S_TKN] +
+                                    vocab[a_tok]).expand_dims(axis=0)
+            pred = kogptqa(input_ids.as_in_context(ctx))
+            gen = vocab.to_tokens(
+                mx.nd.argmax(
+                    pred,
+                    axis=-1).squeeze().astype('int').asnumpy().tolist())[-1]
+            if gen == EOS:
+                break
+            a += gen.replace('▁', ' ')
+            a_tok = tok(a)
+        print("Simsimi > {}".format(a.strip()))
+        return_list.append(a.strip())
+        ques_list.append(sen)
+    return ques_list, return_list
+
+def endofstr(text_list):
+    f_list=[]
+    b_list=[]
+    for text in text_list:
+        idx=text.rfind(' ')
+        if text.find(' ',idx+1)==-1: 
+            f_list.append(text[:idx])
+            b_list.append(text[idx+1:])
+            
+    return f_list, b_list
+
+#minjoo modify) add seq2seq
+def seq2seq_evaluate(text_list):
+    #load model
+    #(dnk model)
+    save_encoder = EncoderRNN(1457,256)
+    save_decoder = AttnDecoderRNN(256, 1419)
+
+    encoder_file = open("./Seq2seq_data/seq2seq_encoder_dnkend_2*11822.pkl", "rb")
+    save_encoder = pickle.load(encoder_file)
+    encoder_file.close()
+
+    decoder_file = open("./Seq2seq_data/seq2seq_decoder_dnkend_2*11822.pkl", "rb")
+    save_decoder = pickle.load(decoder_file)
+    decoder_file.close()
+
+    #load model
+    #(us model)
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    save_encoder = EncoderRNN(4794,256)
+    save_decoder = AttnDecoderRNN(256, 3155)
+    
+    checkpoint = torch.load('seq2seq_us_encoder.pt', map_location=device)
+    save_encoder.load_state_dict(checkpoint)
+    checkpoint = torch.load('seq2seq_us_decoder.pt', map_location=device)
+    save_decoder.load_state_dict(checkpoint)
+    """
+    
+    #predict
+    output_list = []
+    for text in text_list:
+        output_words, attentions = evaluate(save_encoder, save_decoder, text)
+        output_sentence = ' '.join(output_words)
+        output_list.append(output_sentence)
+        print(output_sentence)
+    return output_list
+        
+
+
+if __name__ == "__main__":
+    if opt.train:
+        train()
+    if opt.chat:
+        question_list, gpt_output_list = chat(opt.model_params, opt.sentiment)
+        f_list, b_list = endofstr(gpt_output_list)
+        seq2seq_output_list = seq2seq_evaluate(b_list)
+        final_output_list=[]
+        for i in range(len(seq2seq_output_list)):
+            final_output_list.append(f_list[i]+' '+seq2seq_output_list[i]) 
+        
+        with open('gpt_s2s_result2.txt', 'wt', encoding = 'UTF-8') as f:
+            for i, question in enumerate(question_list):
+                print(question, file =f, end = '\t')
+                print(gpt_output_list[i], file =f, end = '\t')
+                print(final_output_list[i], file =f, end = '\n')
+              
